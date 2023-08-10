@@ -284,19 +284,6 @@ impl eframe::App for App {
                         self.media_idx = self.media_idx.map(|i| (i + 1) % n);
                         self.new_player(ctx);
                     }
-                    if let Some(player) = self.player.as_mut() {
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("volume");
-                            let mut volume = player.audio_volume.get();
-                            if ui
-                                .add(Slider::new(&mut volume, 0.0..=player.max_audio_volume))
-                                .changed()
-                            {
-                                player.audio_volume.set(volume);
-                            };
-                        });
-                    }
                     if let Some(i) = self.media_idx {
                         let fh = file_hash(&self.videos_filtered[i]);
                         if !self.tags.db.contains_key(&fh) {
