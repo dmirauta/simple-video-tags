@@ -1,9 +1,10 @@
 use eframe::NativeOptions;
-use egui::{CentralPanel, Sense, Slider, TextEdit, Window};
+use egui::{CentralPanel, ScrollArea};
 use egui_video::{AudioDevice, Player};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    error::Error,
     fs::{self},
     path::{Path, PathBuf},
 };
@@ -37,26 +38,23 @@ fn has_allowed_extension(path: &PathBuf) -> bool {
         .is_some()
 }
 
-fn write_json<S>(name: &str, serializable: &S)
+fn write_json<S>(name: &str, serializable: &S) -> Result<(), Box<dyn Error>>
 where
     S: Serialize,
 {
     let filename = format!("{name}.json");
-    fs::write(
-        filename.clone(),
-        serde_json::to_string(serializable).expect("{name} to_string fail"),
-    )
-    .expect("failed to write {filename}");
+    fs::write(filename.clone(), serde_json::to_string(serializable)?)?;
     println!("wrote {filename}");
+    Ok(())
 }
 
-fn load_json<D>(name: &str) -> D
+fn load_json<D>(name: &str) -> Result<D, Box<dyn Error>>
 where
     D: DeserializeOwned,
 {
     let filename = format!("{name}.json");
-    let file_contents = fs::read_to_string(filename).expect("{filename} load err");
-    serde_json::from_str(file_contents.as_str()).expect("{filename} deserialize err")
+    let file_contents = fs::read_to_string(filename)?;
+    Ok(serde_json::from_str(file_contents.as_str())?)
 }
 
 /// expects to be handed a list of files from the same folder
@@ -65,7 +63,7 @@ fn folder_hashes(paths: &Vec<PathBuf>, update: bool) -> HashMap<String, PathBuf>
     let hash_path = parent.join(".hashes");
     let hash_filename = hash_path.to_str().unwrap();
     let fbh: FilesByHash = if parent.join(".hashes.json").exists() && !update {
-        load_json(hash_filename)
+        load_json(hash_filename).unwrap()
     } else {
         let temp = FilesByHash {
             db: paths
@@ -78,7 +76,7 @@ fn folder_hashes(paths: &Vec<PathBuf>, update: bool) -> HashMap<String, PathBuf>
                 })
                 .collect(),
         };
-        write_json(hash_filename, &temp);
+        write_json(hash_filename, &temp).unwrap();
         temp
     };
     fbh.db
@@ -135,11 +133,10 @@ impl Default for App {
             .expect("tags.json deserialize err");
             // dbg!(&tags);
         } else {
-            write_json("tags", &tags);
+            write_json("tags", &tags).unwrap();
         }
         Self {
-            audio_device: egui_video::init_audio_device(&sdl2::init().unwrap().audio().unwrap())
-                .unwrap(),
+            audio_device: AudioDevice::new().unwrap(),
             videos: vec![],
             paths_from_hash: HashMap::new(),
             videos_filtered: vec![],
@@ -210,101 +207,100 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint();
         CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.update_hashes_on_load, "recalculate folder hashes");
+            ScrollArea::vertical().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.update_hashes_on_load,
+                        "recalculate folder hashes on load folder",
+                    );
 
-                let mut temp = String::new();
-                let tedit_resp = ui.add_sized(
-                    [ui.available_width(), ui.available_height()],
-                    TextEdit::singleline(&mut temp)
-                        .hint_text("click to add folder")
-                        .interactive(false),
-                );
+                    if ui.button("add folder").clicked() {
+                        if let Some(path_buf) = rfd::FileDialog::new().pick_folder() {
+                            self.load_folder(path_buf);
+                            self.update_filtered();
+                            self.new_player(ctx);
+                        }
+                    }
+                });
 
-                if ui
-                    .interact(
-                        tedit_resp.rect,
-                        tedit_resp.id.with("click_sense"),
-                        Sense::click(),
-                    )
-                    .clicked()
-                {
-                    if let Some(path_buf) = rfd::FileDialog::new().pick_folder() {
-                        self.load_folder(path_buf);
+                ui.label(format!("{} video files loaded", self.videos.len()));
+
+                ui.horizontal(|ui| {
+                    ui.label("Filter for those containing");
+                    let mut any_changed = false;
+                    for opt in self.tags.options.iter() {
+                        let mut temp = self.tag_filter.contains(opt);
+                        if ui.checkbox(&mut temp, opt.clone()).changed() {
+                            any_changed = true;
+                        }
+                        match temp {
+                            true => self.tag_filter.insert(opt.clone()),
+                            false => self.tag_filter.remove(opt),
+                        };
+                    }
+                    if any_changed {
+                        self.update_filtered();
                         self.new_player(ctx);
                     }
-                }
-            });
-            ui.label(format!("{} video files loaded", self.videos.len()));
-            ui.horizontal(|ui| {
-                ui.label("Filter for those containing");
-                let mut any_changed = false;
-                for opt in self.tags.options.iter() {
-                    let mut temp = self.tag_filter.contains(opt);
-                    if ui.checkbox(&mut temp, opt.clone()).changed() {
-                        any_changed = true;
-                    }
-                    match temp {
-                        true => self.tag_filter.insert(opt.clone()),
-                        false => self.tag_filter.remove(opt),
-                    };
-                }
-                if any_changed {
-                    self.update_filtered();
-                    self.new_player(ctx);
-                }
-            });
-            ui.label(format!(
-                "{} of {} satisfy filter",
-                self.videos_filtered.len(),
-                self.videos.len()
-            ));
-            if let Some(i) = self.media_idx {
+                });
+
                 ui.label(format!(
-                    "selected: {:?} ({} of {})",
-                    &self.videos_filtered[i],
-                    i + 1,
-                    self.videos_filtered.len()
+                    "{} of {} satisfy filter",
+                    self.videos_filtered.len(),
+                    self.videos.len()
                 ));
-            }
-            ui.separator();
-            if let Some(player) = self.player.as_mut() {
-                let width = ui.available_width();
-                let height_ratio = (player.height as f32) / (player.width as f32);
-                player.ui(ui, [width, width * height_ratio]);
-            }
-            ui.horizontal(|ui| {
-                let n = self.videos_filtered.len();
-                if n > 0 {
-                    if ui.button("Prev").clicked() {
-                        self.media_idx = self.media_idx.map(|i| (i + n - 1) % n);
-                        self.new_player(ctx);
-                    }
-                    if ui.button("Next").clicked() {
-                        self.media_idx = self.media_idx.map(|i| (i + 1) % n);
-                        self.new_player(ctx);
-                    }
-                    if let Some(i) = self.media_idx {
-                        let fh = file_hash(&self.videos_filtered[i]);
-                        if !self.tags.db.contains_key(&fh) {
-                            self.tags.db.insert(fh.clone(), HashSet::new());
-                        }
-                        ui.separator();
-                        ui.label("Tags");
-                        for opt in self.tags.options.iter() {
-                            let mut temp = self.tags.db[&fh].contains(opt);
-                            ui.checkbox(&mut temp, opt.clone());
-                            let vid_tags = self.tags.db.get_mut(&fh).unwrap();
-                            match temp {
-                                true => vid_tags.insert(opt.clone()),
-                                false => vid_tags.remove(opt),
-                            };
-                        }
-                        if ui.button("Save tags").clicked() {
-                            write_json("tags", &self.tags);
-                        }
-                    }
+
+                if let Some(i) = self.media_idx {
+                    ui.label(format!(
+                        "selected: {:?} ({} of {})",
+                        &self.videos_filtered[i],
+                        i + 1,
+                        self.videos_filtered.len()
+                    ));
                 }
+
+                ui.separator();
+
+                if let Some(player) = self.player.as_mut() {
+                    let width = ui.available_width();
+                    let height_ratio = (player.size.y as f32) / (player.size.x as f32);
+                    player.ui(ui, [width, width * height_ratio].into());
+                }
+
+                // additional player controls
+                ui.horizontal(|ui| {
+                    let n = self.videos_filtered.len();
+                    if n > 0 {
+                        if ui.button("Prev").clicked() {
+                            self.media_idx = self.media_idx.map(|i| (i + n - 1) % n);
+                            self.new_player(ctx);
+                        }
+                        if ui.button("Next").clicked() {
+                            self.media_idx = self.media_idx.map(|i| (i + 1) % n);
+                            self.new_player(ctx);
+                        }
+                        if let Some(i) = self.media_idx {
+                            let fh = file_hash(&self.videos_filtered[i]);
+                            if !self.tags.db.contains_key(&fh) {
+                                self.tags.db.insert(fh.clone(), HashSet::new());
+                            }
+                            ui.separator();
+                            ui.label("Tags");
+                            for opt in self.tags.options.iter() {
+                                let mut temp = self.tags.db[&fh].contains(opt);
+                                ui.checkbox(&mut temp, opt.clone());
+                                let vid_tags = self.tags.db.get_mut(&fh).unwrap();
+                                match temp {
+                                    true => vid_tags.insert(opt.clone()),
+                                    false => vid_tags.remove(opt),
+                                };
+                            }
+                            if ui.button("Save tags").clicked() {
+                                write_json("tags", &self.tags).unwrap();
+                            }
+                        }
+                    }
+                });
             });
         });
     }
